@@ -1,7 +1,8 @@
 // Uncomment this block to pass the first stage
 use std::fmt::Display;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug)]
 struct Request {
@@ -71,9 +72,9 @@ impl Response {
         self.status_text = status_text.to_string();
     }
 
-    fn send(&self, stream: &mut TcpStream) {
+    async fn send(&self, stream: &mut TcpStream) {
         let response = format!("{}", self);
-        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(response.as_bytes()).await.unwrap();
     }
 
     fn new_404() -> Self {
@@ -100,7 +101,7 @@ impl Display for Response {
     }
 }
 
-type Handler = fn(&mut TcpStream, &Request);
+type Handler = fn(&Request) -> Response;
 struct Server {
     tcp_listener: TcpListener,
     root_handler: Option<Handler>,
@@ -108,8 +109,8 @@ struct Server {
 }
 
 impl Server {
-    fn new(addr: &str) -> Self {
-        let tcp_listener = TcpListener::bind(addr).unwrap();
+    async fn new(addr: &str) -> Self {
+        let tcp_listener = TcpListener::bind(addr).await.unwrap();
         let routes = Vec::new();
 
         Self {
@@ -127,51 +128,54 @@ impl Server {
         self.root_handler = Some(handler);
     }
 
-    fn listen(&self) {
-        for stream in self.tcp_listener.incoming() {
-            match stream {
-                Ok(mut stream) => {
-                    let mut buf = [0; 4096];
-                    stream.read(&mut buf).unwrap();
+    async fn listen(self: Arc<Self>) {
+        loop {
+            let (mut stream, _) = self.tcp_listener.accept().await.unwrap();
 
-                    let req = Request::new(&String::from_utf8_lossy(&buf[..]));
-
-                    if req.path == "/" {
-                        if let Some(root_handler) = self.root_handler {
-                            root_handler(&mut stream, &req);
-                            return;
-                        } else {
-                            let response = Response::new_404();
-                            response.send(&mut stream);
-                        }
-                    }
-
-                    if let Some((_, handler)) = self
-                        .routes
-                        .iter()
-                        .find(|(path, _)| req.path.starts_with(path))
-                        .cloned()
-                    {
-                        handler(&mut stream, &req);
-                    } else {
-                        let mut response = Response::new_404();
-                        response.send(&mut stream);
-                    }
+            tokio::spawn({
+                let me = Arc::clone(&self);
+                async move {
+                    me.handle_connection(&mut stream).await;
                 }
-                Err(e) => {
-                    println!("error: {}", e);
-                }
+            });
+        }
+    }
+
+    async fn handle_connection(&self, tcp_stream: &mut TcpStream) {
+        let mut buf = [0; 4096];
+        tcp_stream.read(&mut buf).await.unwrap();
+
+        let req = Request::new(&String::from_utf8_lossy(&buf[..]));
+
+        if req.path == "/" {
+            if let Some(root_handler) = self.root_handler {
+                root_handler(&req).send(tcp_stream).await;
+                return;
+            } else {
+                let response = Response::new_404();
+                response.send(tcp_stream).await;
             }
+        }
+
+        if let Some((_, handler)) = self
+            .routes
+            .iter()
+            .find(|(path, _)| req.path.starts_with(path))
+            .cloned()
+        {
+            handler(&req).send(tcp_stream).await;
+        } else {
+            let response = Response::new_404();
+            response.send(tcp_stream).await;
         }
     }
 }
 
-fn handle_root(stream: &mut TcpStream, _: &Request) {
-    let response = Response::new();
-    response.send(stream);
+fn handle_root(_: &Request) -> Response {
+    Response::new()
 }
 
-fn handle_echo_request(stream: &mut TcpStream, req: &Request) {
+fn handle_echo_request(req: &Request) -> Response {
     let mut response = Response::new();
 
     let echo_string = req.path.strip_prefix("/echo/").unwrap_or("");
@@ -179,10 +183,10 @@ fn handle_echo_request(stream: &mut TcpStream, req: &Request) {
     response.set_header("Content-Length", &echo_string.len().to_string());
     response.set_body(echo_string);
 
-    response.send(stream);
+    response
 }
 
-fn handle_user_agent_request(stream: &mut TcpStream, req: &Request) {
+fn handle_user_agent_request(req: &Request) -> Response {
     let mut response = Response::new();
 
     let user_agent = req.get_header("User-Agent").unwrap_or("Unknown");
@@ -190,15 +194,17 @@ fn handle_user_agent_request(stream: &mut TcpStream, req: &Request) {
     response.set_header("Content-Length", &user_agent.len().to_string());
     response.set_body(user_agent);
 
-    response.send(stream);
+    response
 }
 
-fn main() {
-    let mut server = Server::new("127.0.0.1:4221");
+#[tokio::main]
+async fn main() {
+    let mut server = Server::new("127.0.0.1:4221").await;
 
     server.set_root_handler(handle_root);
     server.register_route("/echo", handle_echo_request);
     server.register_route("/user-agent", handle_user_agent_request);
 
-    server.listen();
+    let arc_server = Arc::new(server);
+    Server::listen(arc_server).await;
 }
