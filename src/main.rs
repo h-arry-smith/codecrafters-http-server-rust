@@ -1,6 +1,8 @@
 use anyhow::Context;
 use anyhow::Result;
 use std::fmt::Display;
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8,12 +10,19 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug)]
 struct Request {
+    verb: Verb,
     path: String,
     headers: Vec<(String, String)>,
+    body: String,
 }
 
 impl Request {
     fn new(request: &str) -> Result<Request> {
+        let verb = match request.split_whitespace().next() {
+            Some("GET") => Verb::Get,
+            Some("POST") => Verb::Post,
+            _ => return Err(anyhow::anyhow!("Unknown verb")),
+        };
         let path = request.split_whitespace().nth(1).unwrap_or("/");
 
         let headers = request
@@ -27,9 +36,13 @@ impl Request {
             })
             .collect();
 
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+
         Ok(Request {
+            verb,
             path: path.to_string(),
             headers,
+            body,
         })
     }
 
@@ -103,11 +116,36 @@ impl Display for Response {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Verb {
+    Get,
+    Post,
+}
+
+#[derive(Debug)]
+struct Route {
+    path: String,
+    verb: Verb,
+}
+
+impl Route {
+    fn new(path: &str, verb: Verb) -> Self {
+        Self {
+            path: path.to_string(),
+            verb,
+        }
+    }
+
+    fn does_match(&self, req: &Request) -> bool {
+        self.verb == req.verb && req.path.starts_with(&self.path)
+    }
+}
+
 type Handler = Box<dyn Fn(&Request) -> Response + Send + Sync>;
 struct Server {
     tcp_listener: TcpListener,
     root_handler: Option<Handler>,
-    routes: Vec<(String, Handler)>,
+    routes: Vec<(Route, Handler)>,
 }
 
 impl Server {
@@ -122,8 +160,8 @@ impl Server {
         }
     }
 
-    fn register_route(&mut self, path: &str, handler: Handler) {
-        self.routes.push((path.to_string(), handler));
+    fn register_route(&mut self, route: Route, handler: Handler) {
+        self.routes.push((route, handler));
     }
 
     fn set_root_handler(&mut self, handler: Handler) {
@@ -149,12 +187,12 @@ impl Server {
 
     async fn handle_connection(&self, tcp_stream: &mut TcpStream) -> Result<()> {
         let mut buf = [0; 4096];
-        tcp_stream
+        let bytes_read = tcp_stream
             .read(&mut buf)
             .await
             .context("problem reading into buffer")?;
 
-        let req = Request::new(&String::from_utf8_lossy(&buf[..]));
+        let req = Request::new(&String::from_utf8_lossy(&buf[0..bytes_read]));
 
         let req = req.context("problem parsing request")?;
 
@@ -169,11 +207,7 @@ impl Server {
             }
         }
 
-        if let Some((_path, handler)) = self
-            .routes
-            .iter()
-            .find(|(path, _)| req.path.starts_with(path))
-        {
+        if let Some((_, handler)) = self.routes.iter().find(|(route, _)| route.does_match(&req)) {
             let response = handler(&req);
 
             response.send(tcp_stream).await;
@@ -233,14 +267,29 @@ fn handle_files_request(req: &Request, files: &[PathBuf]) -> Response {
     }
 }
 
+fn handle_post_file(req: &Request, directory: &Path) -> Response {
+    let file_name = req.path.strip_prefix("/files/").unwrap_or("");
+    let body_bytes = req.body.as_bytes();
+
+    let mut file = std::fs::File::create(directory.join(file_name)).unwrap();
+    file.write_all(body_bytes).unwrap();
+
+    // FIXME: Create a response with a given status code
+    let mut response = Response::new();
+    response.set_status_code(201);
+    response
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     let mut files = Vec::new();
+    let mut dir = std::env::current_dir()?;
     if args.len() == 3 && args[1] == "--directory" {
-        let dir = std::fs::read_dir(&args[2])?;
+        dir = PathBuf::from(&args[2]);
+        let dir_contents = std::fs::read_dir(&args[2])?;
 
-        for entry in dir {
+        for entry in dir_contents {
             let entry = entry?;
             let path = entry.path();
             if path.is_file() {
@@ -252,12 +301,23 @@ async fn main() -> anyhow::Result<()> {
     let mut server = Server::new("127.0.0.1:4221").await;
 
     server.set_root_handler(Box::new(handle_root));
-    server.register_route("/echo", Box::new(handle_echo_request));
-    server.register_route("/user-agent", Box::new(handle_user_agent_request));
+    server.register_route(
+        Route::new("/echo", Verb::Get),
+        Box::new(handle_echo_request),
+    );
+    server.register_route(
+        Route::new("/user-agent", Verb::Get),
+        Box::new(handle_user_agent_request),
+    );
 
     server.register_route(
-        "/files",
+        Route::new("/files", Verb::Get),
         Box::new(move |req| handle_files_request(req, &files)),
+    );
+
+    server.register_route(
+        Route::new("/files", Verb::Post),
+        Box::new(move |req| handle_post_file(req, &dir)),
     );
 
     let arc_server = Arc::new(server);
