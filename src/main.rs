@@ -102,7 +102,7 @@ impl Display for Response {
     }
 }
 
-type Handler = fn(&Request) -> Response;
+type Handler = Box<dyn Fn(&Request) -> Response + Send + Sync>;
 struct Server {
     tcp_listener: TcpListener,
     root_handler: Option<Handler>,
@@ -158,7 +158,7 @@ impl Server {
         let req = req.context("problem parsing request")?;
 
         if req.path == "/" {
-            if let Some(root_handler) = self.root_handler {
+            if let Some(root_handler) = &self.root_handler {
                 root_handler(&req).send(tcp_stream).await;
                 return Ok(());
             } else {
@@ -215,9 +215,9 @@ fn handle_user_agent_request(req: &Request) -> Response {
 async fn main() -> anyhow::Result<()> {
     let mut server = Server::new("127.0.0.1:4221").await;
 
-    server.set_root_handler(handle_root);
-    server.register_route("/echo", handle_echo_request);
-    server.register_route("/user-agent", handle_user_agent_request);
+    server.set_root_handler(Box::new(handle_root));
+    server.register_route("/echo", Box::new(handle_echo_request));
+    server.register_route("/user-agent", Box::new(handle_user_agent_request));
 
     let arc_server = Arc::new(server);
     Server::listen(arc_server).await?;
