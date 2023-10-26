@@ -1,4 +1,5 @@
-// Uncomment this block to pass the first stage
+use anyhow::Context;
+use anyhow::Result;
 use std::fmt::Display;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,7 +12,7 @@ struct Request {
 }
 
 impl Request {
-    fn new(request: &str) -> Request {
+    fn new(request: &str) -> Result<Request> {
         let path = request.split_whitespace().nth(1).unwrap_or("/");
 
         let headers = request
@@ -25,10 +26,10 @@ impl Request {
             })
             .collect();
 
-        Request {
+        Ok(Request {
             path: path.to_string(),
             headers,
-        }
+        })
     }
 
     fn get_header(&self, key: &str) -> Option<&str> {
@@ -128,36 +129,46 @@ impl Server {
         self.root_handler = Some(handler);
     }
 
-    async fn listen(self: Arc<Self>) {
+    async fn listen(self: Arc<Self>) -> Result<()> {
         loop {
-            let (mut stream, _) = self.tcp_listener.accept().await.unwrap();
+            let (mut stream, _) = self
+                .tcp_listener
+                .accept()
+                .await
+                .context("Error accepting")?;
 
             tokio::spawn({
                 let me = Arc::clone(&self);
                 async move {
-                    me.handle_connection(&mut stream).await;
+                    let _ = me.handle_connection(&mut stream).await;
                 }
             });
         }
     }
 
-    async fn handle_connection(&self, tcp_stream: &mut TcpStream) {
+    async fn handle_connection(&self, tcp_stream: &mut TcpStream) -> Result<()> {
         let mut buf = [0; 4096];
-        tcp_stream.read(&mut buf).await.unwrap();
+        tcp_stream
+            .read(&mut buf)
+            .await
+            .context("problem reading into buffer")?;
 
         let req = Request::new(&String::from_utf8_lossy(&buf[..]));
+
+        let req = req.context("problem parsing request")?;
 
         if req.path == "/" {
             if let Some(root_handler) = self.root_handler {
                 root_handler(&req).send(tcp_stream).await;
-                return;
+                return Ok(());
             } else {
                 let response = Response::new_404();
                 response.send(tcp_stream).await;
+                return Ok(());
             }
         }
 
-        if let Some((_, handler)) = self
+        if let Some((_path, handler)) = self
             .routes
             .iter()
             .find(|(path, _)| req.path.starts_with(path))
@@ -167,7 +178,10 @@ impl Server {
         } else {
             let response = Response::new_404();
             response.send(tcp_stream).await;
+            return Ok(());
         }
+
+        Ok(())
     }
 }
 
@@ -198,7 +212,7 @@ fn handle_user_agent_request(req: &Request) -> Response {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let mut server = Server::new("127.0.0.1:4221").await;
 
     server.set_root_handler(handle_root);
@@ -206,5 +220,7 @@ async fn main() {
     server.register_route("/user-agent", handle_user_agent_request);
 
     let arc_server = Arc::new(server);
-    Server::listen(arc_server).await;
+    Server::listen(arc_server).await?;
+
+    Ok(())
 }
