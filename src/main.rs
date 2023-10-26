@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -172,9 +173,10 @@ impl Server {
             .routes
             .iter()
             .find(|(path, _)| req.path.starts_with(path))
-            .cloned()
         {
-            handler(&req).send(tcp_stream).await;
+            let response = handler(&req);
+
+            response.send(tcp_stream).await;
         } else {
             let response = Response::new_404();
             response.send(tcp_stream).await;
@@ -211,13 +213,52 @@ fn handle_user_agent_request(req: &Request) -> Response {
     response
 }
 
+fn handle_files_request(req: &Request, files: &[PathBuf]) -> Response {
+    let given_file_name = req.path.strip_prefix("/files/").unwrap_or("");
+
+    if let Some(file) = files
+        .iter()
+        .find(|file| file.file_name().unwrap_or_default() == given_file_name)
+    {
+        let mut response = Response::new();
+        let file_contents = std::fs::read_to_string(file).unwrap_or_default();
+
+        response.set_header("Content-Type", "application/octet-stream");
+        response.set_header("Content-Length", &file_contents.len().to_string());
+        response.set_body(&file_contents);
+
+        response
+    } else {
+        Response::new_404()
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = std::env::args().collect::<Vec<_>>();
+    let mut files = Vec::new();
+    if args.len() == 3 && args[1] == "--directory" {
+        let dir = std::fs::read_dir(&args[2])?;
+
+        for entry in dir {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+
     let mut server = Server::new("127.0.0.1:4221").await;
 
     server.set_root_handler(Box::new(handle_root));
     server.register_route("/echo", Box::new(handle_echo_request));
     server.register_route("/user-agent", Box::new(handle_user_agent_request));
+
+    server.register_route(
+        "/files",
+        Box::new(move |req| handle_files_request(req, &files)),
+    );
 
     let arc_server = Arc::new(server);
     Server::listen(arc_server).await?;
